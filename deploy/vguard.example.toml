@@ -1,0 +1,58 @@
+# vguard: the read policy of a relay, between nginx and strfry (spec/vguard.md).
+# On a server of the Veydan-Server kit the kit writes this file; this is the
+# example for a relay set up by hand. Apply a change: systemctl restart vguard
+
+# nginx hands the WebSocket of the relay here; strfry listens on upstream.
+listen = "127.0.0.1:7778"
+upstream = "127.0.0.1:7777"
+# The relay tag of an AUTH must name one of these: the host names a client
+# reaches this relay by.
+relay_hosts = ["relay.example.org"]
+# The keys denied on every server of the network, and the groups closed on
+# its relays, one a line (spec/vguard.md, "Denied keys", "Denied groups");
+# read again when they change. No file, nobody denied.
+#denied_keys_file = "/opt/vguard/data/denied-keys.txt"
+#denied_groups_file = "/opt/vguard/data/denied-groups.txt"
+
+# Limits; the defaults follow strfry.conf (maxWebsocketPayloadSize,
+# maxSubsPerConnection, maxReqFilterSize) and nginx (proxy_read_timeout).
+[limits]
+#max_frame = 262144
+#max_subs = 200
+#max_filters = 200
+#max_connections = 20000
+#idle_secs = 300
+# How far the clock of a phone may be off and it still signs in (3 days),
+# and how long a question before the AUTH waits for it, milliseconds.
+#auth_skew_secs = 259200
+#auth_wait_ms = 5000
+
+[log]
+#level = "info"
+# The counters (connections, questions refused and why) go to the journal
+# this often, seconds.
+metrics_secs = 300
+
+# Who may use the relay (spec/vguard.md, "Access modes"): open (anybody with
+# the app key, as before 0.7.0; the default without this section), team
+# (members alone, who get in by an invite code), channel (anybody reads what
+# is public and joins and comments slowly; the members, the authors, write).
+# A team or a channel needs every file, listen_http and public_url; nginx
+# puts the access API (listen_http) under the relay's host:
+# /.well-known/veydan-access/ and, for auth_request of the media host,
+# /_access. Members and invites: vguard access --config … (spec/vguard.md,
+# "Running it"); systemctl reload vguard reads the members again at once.
+#[access]
+#mode = "open"
+#members_file = "/opt/vguard/data/members.txt"
+# Always admitted, and the keys of the admin endpoints: npub or 64 hex.
+#admins = ["npub1…"]
+#invites_file = "/opt/vguard/data/invites.json"
+# At least 32 bytes of random: head -c 32 /dev/urandom > access.key
+#secret_file = "/opt/vguard/etc/access.key"
+#listen_http = "127.0.0.1:7779"
+# What NIP-98 requests are signed for: the relay's address, no trailing slash.
+#public_url = "https://relay.example.org"
+# A channel: what a guest may write ([] = a read-only server), and how much.
+#guest_kinds = [0, 10002, 10050, 1059, 1390, 21390]
+#guest_events_per_minute = 30

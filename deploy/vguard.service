@@ -1,0 +1,48 @@
+[Unit]
+Description=vguard (read policy of the Veydan relay, between nginx and strfry)
+After=network-online.target strfry.service
+Wants=network-online.target strfry.service
+
+[Service]
+User=vguard
+Group=vguard
+ExecStart=/opt/vguard/bin/vguard serve --config /opt/vguard/etc/vguard.toml
+# SIGHUP: the denied lists and the members read again at once.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+UMask=0027
+LimitNOFILE=65536
+
+# The proxy needs the loopback network and its config, nothing else of the
+# machine; a team or a channel writes its members and invites in data/ (a
+# join, the admin endpoints), and nothing else.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=-/opt/vguard/data
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
