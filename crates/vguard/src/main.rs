@@ -9,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use vguard::config::{self, Config};
 use vguard::access::{key_hex, Mode};
+use vguard::access_lock;
 use vguard::api;
 use vguard::invites::Invites;
 use vguard::proxy::{self, Shared};
@@ -34,6 +35,8 @@ enum Command {
     Serve(ConfigArg),
     /// Read the config and report every problem in it.
     CheckConfig(ConfigArg),
+    /// Print the access mode from the parsed config.
+    Mode(ConfigArg),
     /// Ask the running proxy one public question through to strfry: the
     /// health check of the kit.
     Probe {
@@ -113,6 +116,13 @@ fn main() -> ExitCode {
         .build()
         .expect("a tokio runtime");
     match cli.command {
+        Command::Mode(arg) => match load(&arg) {
+            Ok(c) => {
+                println!("{}", c.access.mode().as_str());
+                ExitCode::SUCCESS
+            }
+            Err(code) => code,
+        },
         Command::CheckConfig(arg) => match load(&arg) {
             // The files of [access] that are there must read too.
             Ok(c) => match vguard::access::check_files(&c.access) {
@@ -338,6 +348,10 @@ fn access(config: &Config, what: AccessCmd) -> ExitCode {
         }
         AccessCmd::Members { what } => {
             let path = c.members_file.as_deref().expect("checked: members_file with a mode not open");
+            let _file = match access_lock::lock(path) {
+                Ok(file) => file,
+                Err(e) => return fail(format!("{}: {e}", path.display())),
+            };
             let members = KeyList::from_file(path);
             let key_of = |s: &str| key_hex(s).ok_or_else(|| format!("{s:?} is not an npub or a key of 64 hex"));
             match what {

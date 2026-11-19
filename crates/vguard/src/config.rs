@@ -127,6 +127,9 @@ impl AccessConfig {
         if self.listen_http.is_none() && mode != Mode::Open {
             problems.push(format!("access.listen_http: needed when the mode is {}", mode.as_str()));
         }
+        if self.listen_http.is_some_and(|addr| !addr.ip().is_loopback()) {
+            problems.push("access.listen_http: must be a loopback address".into());
+        }
         match &self.public_url {
             Some(u) => {
                 if let Err(why) = check_public_url(u) {
@@ -409,6 +412,10 @@ mod tests {
         assert!(Config::parse(&full.replace("/opt/vguard/data/members.txt", "members.txt")).unwrap_err().contains("absolute"));
         assert!(Config::parse(&full.replace(&npub, "npub1nope")).unwrap_err().contains("access.admins"));
         assert!(Config::parse(&full.replace("127.0.0.1:7779", "127.0.0.1:7778")).unwrap_err().contains("listen_http"));
+        for address in ["0.0.0.0:7779", "192.0.2.1:7779", "[::]:7779"] {
+            assert!(Config::parse(&full.replace("127.0.0.1:7779", address)).unwrap_err().contains("loopback"));
+        }
+        assert!(Config::parse(&full.replace("127.0.0.1:7779", "[::1]:7779")).is_ok());
         assert!(bad("guest_events_per_minute = 0").unwrap_err().contains("guest_events_per_minute"));
         assert!(bad("nope = 1").is_err(), "an unknown key is an error");
         assert!(bad("guest_kinds = []").is_ok(), "a read-only channel");

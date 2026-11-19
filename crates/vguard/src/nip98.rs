@@ -7,7 +7,7 @@
 //! for, made within a minute of now. An event opens one request: its id
 //! is remembered for as long as it could be used again.
 //!
-//! `services/push/crates/vpush-server/src/auth.rs` has the same check of
+//! `Veydan-Push/crates/vpush-server/src/auth.rs` has the same check of
 //! NIP-98; the two move to a shared crate of Veydan-Common later.
 
 use std::collections::{HashSet, VecDeque};
@@ -43,6 +43,12 @@ pub enum AuthError {
     Replay,
     /// As many used events are remembered as may be.
     Busy,
+}
+
+/// A signed request whose event has not yet used a replay slot.
+pub struct Verified {
+    pub pubkey: String,
+    pub event: [u8; 32],
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -135,6 +141,20 @@ impl Nip98 {
         body: &[u8],
         now: u64,
     ) -> Result<String, AuthError> {
+        let verified = self.verify(header, method, path_and_query, body, now)?;
+        self.remember(verified.event)?;
+        Ok(verified.pubkey)
+    }
+
+    /// Check the signature and request tags without consuming a replay slot.
+    pub fn verify(
+        &self,
+        header: Option<&str>,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+        now: u64,
+    ) -> Result<Verified, AuthError> {
         let event = event_of(header)?;
         if event.kind != Kind::from(KIND_HTTP_AUTH) {
             return Err(AuthError::Invalid(format!("the event is not of kind {KIND_HTTP_AUTH}")));
@@ -159,11 +179,11 @@ impl Nip98 {
                 None => return Err(AuthError::Invalid("no `payload` tag".into())),
             }
         }
-        self.seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take(event.id.to_bytes(), Instant::now())?;
-        Ok(event.pubkey.to_hex())
+        Ok(Verified { pubkey: event.pubkey.to_hex(), event: event.id.to_bytes() })
+    }
+
+    pub fn remember(&self, event: [u8; 32]) -> Result<(), AuthError> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).take(event, Instant::now())
     }
 }
 
@@ -245,6 +265,18 @@ mod tests {
         assert_eq!(s.take([1; 32], t + Duration::from_secs(60)), Err(AuthError::Replay));
         assert!(s.take([1; 32], t + REMEMBER).is_ok());
         assert_eq!(s.order.len(), 1);
+    }
+
+    #[test]
+    fn verification_does_not_remember_until_requested() {
+        let n = Nip98::new(BASE);
+        let keys = Keys::generate();
+        let h = signed(&keys, &format!("{BASE}{PATH}"), "POST", b"{}", NOW);
+        let first = n.verify(Some(&h), "POST", PATH, b"{}", NOW).unwrap();
+        let second = n.verify(Some(&h), "POST", PATH, b"{}", NOW).unwrap();
+        assert_eq!(first.event, second.event);
+        n.remember(first.event).unwrap();
+        assert_eq!(n.remember(second.event), Err(AuthError::Replay));
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! (`api`, `nip98`, `invites`).
 
 pub mod access;
+pub mod access_lock;
 pub mod api;
 pub mod auth;
 pub mod config;

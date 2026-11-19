@@ -1956,12 +1956,12 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veydan-denied"
-version = "0.1.0"
-source = "git+https://github.com/veydanproject/Veydan-Common?tag=v0.1.0#d3c9b2cc6eae443ddc557e32fc8beb2ed2e5d763"
+version = "0.1.1"
+source = "git+https://github.com/veydanproject/Veydan-Common?tag=v0.1.1#4560b035f743fd6c02202f14b35fa574da104e2f"
 
 [[package]]
 name = "vguard"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",

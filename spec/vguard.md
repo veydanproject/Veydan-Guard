@@ -287,6 +287,9 @@ use. A used-up invite stays listed until it expires, so that a second use
 is told `invite_used`; an expired one stays listed 30 days more (told
 `invite_expired`), then the next write drops it. A revoked one is gone
 (`invite_invalid`). The running guard reads the file on every join.
+The daemon and `vguard access` hold an exclusive `flock` on `access.lock`
+beside `members_file` across each access-file read-modify-write; a join holds
+it until both the invite use and new member are written.
 
 ## The access API
 
@@ -314,7 +317,7 @@ but `/_access` is JSON; an error is `{"error": "<word>"}`.
 An admin endpoint answers `401 auth_invalid` without a good signature,
 `403 not_admin` for a key not in `admins`, `403 mode_open` on an open
 server. `429 busy` when 100 000 signed requests are remembered at once.
-The check of NIP-98 is the one of VPush (`vpush-server/src/auth.rs`); the
+The check of NIP-98 is the one of VPush (`Veydan-Push/crates/vpush-server/src/auth.rs`); the
 two move to a crate of Veydan-Common later.
 
 ## Media access

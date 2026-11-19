@@ -5,6 +5,13 @@ Versions of VGuard are its own and do not follow the app. Tags are
 where it lived from 0.4.0 to 0.5.1: a kit reads `VGUARD_VERSION` as one
 line of numbers.
 
+## 0.7.1 — serialize access file changes
+
+- The daemon and `vguard access` share an exclusive `access.lock` while
+  changing members or invites. Parallel joins and admin commands preserve
+  every member and account for each invite use.
+- Member file replacement uses a unique temporary file per write.
+
 ## 0.7.0 — access modes: open, team, channel
 
 - A server has an access mode, `[access] mode` (`spec/vguard.md`, "Access

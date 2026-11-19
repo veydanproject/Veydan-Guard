@@ -24,8 +24,10 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use veydan_denied::KeyList;
 
 use crate::access::{key_hex, Access};
+use crate::access_lock;
 use crate::invites::{Invites, Redeem};
 use crate::metrics::add;
 use crate::nip98::{self, AuthError, Nip98};
@@ -37,6 +39,7 @@ pub const BASE: &str = "/.well-known/veydan-access/v1";
 pub const MEDIA: &str = "/_access";
 /// Joins per address per minute.
 pub const JOINS_PER_MINUTE: u32 = 10;
+const AUTH_PER_MINUTE: u32 = 60;
 /// Addresses counted at once; past this many a join waits for room.
 const MAX_ADDRESSES: usize = 100_000;
 /// The largest body taken.
@@ -50,6 +53,36 @@ fn now() -> u64 {
 #[derive(Default)]
 struct Joins {
     per_ip: HashMap<IpAddr, (Instant, u32)>,
+}
+
+#[derive(Default)]
+struct AuthLimits {
+    per_ip: HashMap<IpAddr, (Instant, u32)>,
+    per_key: HashMap<String, (Instant, u32)>,
+}
+
+impl AuthLimits {
+    fn allow(&mut self, ip: IpAddr, key: &str, at: Instant) -> bool {
+        fn take<K: std::hash::Hash + Eq + Clone>(map: &mut HashMap<K, (Instant, u32)>, key: K, at: Instant) -> bool {
+            let minute = Duration::from_secs(60);
+            if map.len() >= MAX_ADDRESSES {
+                map.retain(|_, (since, _)| at.saturating_duration_since(*since) < minute);
+                if map.len() >= MAX_ADDRESSES && !map.contains_key(&key) {
+                    return false;
+                }
+            }
+            let (since, count) = map.entry(key).or_insert((at, 0));
+            if at.saturating_duration_since(*since) >= minute {
+                *since = at;
+                *count = 0;
+            }
+            *count += 1;
+            *count <= AUTH_PER_MINUTE
+        }
+        // Both budgets apply. A stream of new keys from one address cannot
+        // fill the replay set or all key counters.
+        take(&mut self.per_ip, ip, at) && take(&mut self.per_key, key.to_owned(), at)
+    }
 }
 
 impl Joins {
@@ -77,6 +110,7 @@ pub struct Api {
     invites: Option<Invites>,
     nip98: Nip98,
     joins: Mutex<Joins>,
+    auth_limits: Mutex<AuthLimits>,
 }
 
 fn error(status: StatusCode, word: &str) -> Response {
@@ -150,7 +184,7 @@ impl Api {
         let c = &shared.config.access;
         let invites = if shared.access.is_open() { None } else { Some(Invites::open(c)?) };
         let nip98 = Nip98::new(c.public_url.as_deref().unwrap_or_default());
-        Ok(Arc::new(Self { shared, invites, nip98, joins: Mutex::default() }))
+        Ok(Arc::new(Self { shared, invites, nip98, joins: Mutex::default(), auth_limits: Mutex::default() }))
     }
 
     fn access(&self) -> &Access {
@@ -158,23 +192,41 @@ impl Api {
     }
 
     /// The signer of a request of the API, or the answer that refuses it.
-    fn signer(&self, headers: &HeaderMap, method: &Method, uri: &Uri, body: &[u8]) -> Result<String, Refuse> {
+    fn verified(&self, headers: &HeaderMap, method: &Method, uri: &Uri, body: &[u8]) -> Result<nip98::Verified, Refuse> {
         let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
         self.nip98
-            .check(header(headers, "authorization"), method.as_str(), path, body, now())
+            .verify(header(headers, "authorization"), method.as_str(), path, body, now())
             .map_err(auth_failed)
     }
 
+    fn limited(&self, peer: SocketAddr, headers: &HeaderMap, key: &str) -> Result<(), Refuse> {
+        let ip = real_ip(peer, headers);
+        if self.auth_limits.lock().unwrap_or_else(|e| e.into_inner()).allow(ip, key, Instant::now()) {
+            Ok(())
+        } else {
+            Err(Refuse(StatusCode::TOO_MANY_REQUESTS, "rate_limited"))
+        }
+    }
+
     /// An admin's request: the mode is not open, the signer is an admin.
-    fn admin(&self, headers: &HeaderMap, method: &Method, uri: &Uri, body: &[u8]) -> Result<&Invites, Refuse> {
+    fn admin(&self, peer: SocketAddr, headers: &HeaderMap, method: &Method, uri: &Uri, body: &[u8]) -> Result<&Invites, Refuse> {
         let Some(invites) = self.invites.as_ref().filter(|_| !self.access().is_open()) else {
             return Err(Refuse(StatusCode::FORBIDDEN, "mode_open"));
         };
-        let key = self.signer(headers, method, uri, body)?;
-        if !self.access().is_admin(&key) {
+        let verified = self.verified(headers, method, uri, body)?;
+        self.limited(peer, headers, &verified.pubkey)?;
+        if !self.access().is_admin(&verified.pubkey) {
             return Err(Refuse(StatusCode::FORBIDDEN, "not_admin"));
         }
+        self.nip98.remember(verified.event).map_err(auth_failed)?;
         Ok(invites)
+    }
+}
+
+fn real_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    match header(headers, REAL_IP_HEADER).and_then(|h| h.trim().parse::<IpAddr>().ok()) {
+        Some(ip) if peer.ip().is_loopback() => ip,
+        _ => peer.ip(),
     }
 }
 
@@ -225,14 +277,11 @@ async fn join(
         return refused(error(StatusCode::FORBIDDEN, "mode_open"));
     };
     // The address nginx saw, from nginx on this machine; else the socket's.
-    let ip = match header(&headers, REAL_IP_HEADER).and_then(|h| h.trim().parse::<IpAddr>().ok()) {
-        Some(ip) if peer.ip().is_loopback() => ip,
-        _ => peer.ip(),
-    };
+    let ip = real_ip(peer, &headers);
     if !api.joins.lock().unwrap_or_else(|e| e.into_inner()).allow(ip, Instant::now()) {
         return refused(error(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
     }
-    let key = match api.signer(&headers, &method, &uri, &body) {
+    let verified = match api.verified(&headers, &method, &uri, &body) {
         Ok(k) => k,
         Err(r) => return refused(r.into_response()),
     };
@@ -240,42 +289,58 @@ async fn join(
         Ok(b) => b,
         Err(r) => return refused(r.into_response()),
     };
+    let Some(path) = api.access().members.path() else {
+        return refused(error(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
+    };
+    let _file = match access_lock::lock(path) {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!("access: the access lock is not available: {e}");
+            return refused(error(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
+        }
+    };
+    let current_members = KeyList::from_file(path);
     // A member already: nothing to use up.
-    if api.access().admits(&key) {
+    if api.access().is_admin(&verified.pubkey) || current_members.contains(&verified.pubkey) {
+        if let Err(e) = api.nip98.remember(verified.event) { return refused(auth_failed(e).into_response()); }
         return ok(json!({ "member": true }));
     }
-    let id = match invites.redeem(&asked.invite, now()) {
+    let id = match invites.redeem_with_locked(&asked.invite, now(), || api.nip98.remember(verified.event)) {
         Ok(id) => id,
         Err(Redeem::Io(why)) => {
             tracing::warn!("access: the invites do not read or write: {why}");
             return refused(error(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
         }
+        Err(Redeem::Auth(e)) => return refused(auth_failed(e).into_response()),
         Err(r) => return refused(error(StatusCode::UNAUTHORIZED, r.word())),
     };
-    if let Err(e) = api.access().members.append(&key) {
+    if let Err(e) = current_members.append(&verified.pubkey) {
         tracing::warn!("access: the members file is not written: {e}");
         return refused(error(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
     }
+    api.access().members.refresh();
     add(&m.joins);
     tracing::info!("access: a member joined by the invite {id}");
     ok(json!({ "member": true }))
 }
 
-async fn me(State(api): State<Arc<Api>>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
-    let key = match api.signer(&headers, &method, &uri, b"") {
+async fn me(State(api): State<Arc<Api>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
+    let verified = match api.verified(&headers, &method, &uri, b"") {
         Ok(k) => k,
         Err(r) => return r.into_response(),
     };
+    if let Err(r) = api.limited(peer, &headers, &verified.pubkey) { return r.into_response(); }
+    if let Err(e) = api.nip98.remember(verified.event) { return auth_failed(e).into_response(); }
     let a = api.access();
     ok(json!({
-        "member": a.is_open() || a.admits(&key),
-        "admin": a.is_admin(&key),
+        "member": a.is_open() || a.admits(&verified.pubkey),
+        "admin": a.is_admin(&verified.pubkey),
         "mode": a.mode.as_str(),
     }))
 }
 
-async fn add_member(State(api): State<Arc<Api>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
-    if let Err(r) = api.admin(&headers, &method, &uri, &body) {
+async fn add_member(State(api): State<Arc<Api>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = api.admin(peer, &headers, &method, &uri, &body) {
         return r.into_response();
     }
     let asked: MemberBody = match body_of(&body) {
@@ -286,43 +351,62 @@ async fn add_member(State(api): State<Arc<Api>>, method: Method, uri: Uri, heade
         return error(StatusCode::BAD_REQUEST, "bad_key");
     };
     let members = &api.access().members;
-    members.refresh();
-    if !members.contains(&key) {
-        if let Err(e) = members.append(&key) {
+    let Some(path) = members.path() else { return error(StatusCode::INTERNAL_SERVER_ERROR, "internal"); };
+    let _file = match access_lock::lock(path) {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!("access: the access lock is not available: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        }
+    };
+    let current_members = KeyList::from_file(path);
+    if !current_members.contains(&key) {
+        if let Err(e) = current_members.append(&key) {
             tracing::warn!("access: the members file is not written: {e}");
             return error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
         }
     }
+    members.refresh();
     ok(json!({ "pubkey": key, "member": true }))
 }
 
 async fn remove_member(
     State(api): State<Arc<Api>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = api.admin(&headers, &method, &uri, b"") {
+    if let Err(r) = api.admin(peer, &headers, &method, &uri, b"") {
         return r.into_response();
     }
     let Some(key) = key_hex(&key) else {
         return error(StatusCode::BAD_REQUEST, "bad_key");
     };
     let members = &api.access().members;
-    members.refresh();
-    if members.contains(&key) {
-        let rest: Vec<String> = members.items().into_iter().filter(|k| *k != key).collect();
-        if let Err(e) = members.write_all(rest.iter().map(String::as_str)) {
+    let Some(path) = members.path() else { return error(StatusCode::INTERNAL_SERVER_ERROR, "internal"); };
+    let _file = match access_lock::lock(path) {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!("access: the access lock is not available: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        }
+    };
+    let current_members = KeyList::from_file(path);
+    if current_members.contains(&key) {
+        let rest: Vec<String> = current_members.items().into_iter().filter(|k| *k != key).collect();
+        if let Err(e) = current_members.write_all(rest.iter().map(String::as_str)) {
             tracing::warn!("access: the members file is not written: {e}");
             return error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
         }
     }
+    members.refresh();
     ok(json!({ "pubkey": key, "member": false }))
 }
 
-async fn create_invite(State(api): State<Arc<Api>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
-    let invites = match api.admin(&headers, &method, &uri, &body) {
+async fn create_invite(State(api): State<Arc<Api>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+    let invites = match api.admin(peer, &headers, &method, &uri, &body) {
         Ok(i) => i,
         Err(r) => return r.into_response(),
     };
@@ -342,8 +426,8 @@ async fn create_invite(State(api): State<Arc<Api>>, method: Method, uri: Uri, he
     }
 }
 
-async fn list_invites(State(api): State<Arc<Api>>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
-    let invites = match api.admin(&headers, &method, &uri, b"") {
+async fn list_invites(State(api): State<Arc<Api>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
+    let invites = match api.admin(peer, &headers, &method, &uri, b"") {
         Ok(i) => i,
         Err(r) => return r.into_response(),
     };
@@ -358,12 +442,13 @@ async fn list_invites(State(api): State<Arc<Api>>, method: Method, uri: Uri, hea
 
 async fn revoke_invite(
     State(api): State<Arc<Api>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    let invites = match api.admin(&headers, &method, &uri, b"") {
+    let invites = match api.admin(peer, &headers, &method, &uri, b"") {
         Ok(i) => i,
         Err(r) => return r.into_response(),
     };
@@ -402,5 +487,25 @@ mod tests {
         assert!(!j.allow(a, t));
         assert!(j.allow(b, t), "another address");
         assert!(j.allow(a, t + Duration::from_secs(60)), "the next minute");
+    }
+
+    #[test]
+    fn fresh_keys_from_one_address_have_a_shared_limit() {
+        let mut limits = AuthLimits::default();
+        let at = Instant::now();
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "198.51.100.2".parse().unwrap();
+        for i in 0..AUTH_PER_MINUTE {
+            assert!(limits.allow(a, &format!("key-{i}"), at));
+        }
+        assert!(!limits.allow(a, "one-more-key", at));
+        assert!(limits.allow(b, "one-more-key", at));
+        assert!(limits.allow(a, "one-more-key", at + Duration::from_secs(60)));
+        let mut by_key = AuthLimits::default();
+        for i in 0..AUTH_PER_MINUTE {
+            let ip: IpAddr = format!("198.51.100.{}", i + 1).parse().unwrap();
+            assert!(by_key.allow(ip, "same-key", at));
+        }
+        assert!(!by_key.allow("203.0.113.2".parse().unwrap(), "same-key", at));
     }
 }

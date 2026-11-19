@@ -18,6 +18,7 @@ use ring::hmac;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AccessConfig;
+use crate::nip98::AuthError;
 
 /// The first word of a code.
 pub const PREFIX: &str = "vi1";
@@ -56,6 +57,8 @@ pub enum Redeem {
     Used,
     /// The file does not read or cannot be written.
     Io(String),
+    /// The signed join event is a replay, or no replay slot is available.
+    Auth(AuthError),
 }
 
 impl Redeem {
@@ -66,6 +69,7 @@ impl Redeem {
             Redeem::Expired => "invite_expired",
             Redeem::Used => "invite_used",
             Redeem::Io(_) => "internal",
+            Redeem::Auth(_) => "auth_invalid",
         }
     }
 }
@@ -116,6 +120,7 @@ pub fn check_new(uses: u32, days: u32, label: &str) -> Result<(), String> {
 
 pub struct Invites {
     path: PathBuf,
+    members_path: PathBuf,
     key: hmac::Key,
     /// One change at a time within this process.
     lock: Mutex<()>,
@@ -123,14 +128,16 @@ pub struct Invites {
 
 impl Invites {
     pub fn new(path: &Path, secret: &[u8]) -> Self {
-        Self { path: path.to_path_buf(), key: hmac::Key::new(hmac::HMAC_SHA256, secret), lock: Mutex::new(()) }
+        Self { path: path.to_path_buf(), members_path: path.with_file_name("members.txt"), key: hmac::Key::new(hmac::HMAC_SHA256, secret), lock: Mutex::new(()) }
     }
 
     /// The invites of the config's `invites_file`, by its `secret_file`.
     pub fn open(c: &AccessConfig) -> Result<Self, String> {
         let path = c.invites_file.as_deref().ok_or("access.invites_file is not set")?;
         let secret = c.secret_file.as_deref().ok_or("access.secret_file is not set")?;
-        Ok(Self::new(path, &read_secret(secret)?))
+        let mut invites = Self::new(path, &read_secret(secret)?);
+        invites.members_path = c.members_file.clone().ok_or("access.members_file is not set")?;
+        Ok(invites)
     }
 
     fn mac(&self, id: &str) -> String {
@@ -186,6 +193,7 @@ impl Invites {
     pub fn create(&self, uses: u32, days: u32, label: &str, now: u64) -> Result<(String, Invite), String> {
         check_new(uses, days, label)?;
         let _one = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _file = crate::access_lock::lock(&self.members_path).map_err(|e| e.to_string())?;
         let mut invites = self.list()?;
         let id = loop {
             let id = crate::auth::new_challenge()[..16].to_string();
@@ -209,6 +217,7 @@ impl Invites {
     /// False when it was not listed.
     pub fn revoke(&self, id: &str, now: u64) -> Result<bool, String> {
         let _one = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _file = crate::access_lock::lock(&self.members_path).map_err(|e| e.to_string())?;
         let mut invites = self.list()?;
         let before = invites.len();
         invites.retain(|i| i.id != id);
@@ -223,8 +232,21 @@ impl Invites {
     /// stays listed until it expires, so that a second use is told
     /// `invite_used`.
     pub fn redeem(&self, code: &str, now: u64) -> Result<String, Redeem> {
-        let id = self.id_of(code).ok_or(Redeem::Invalid)?;
+        self.redeem_with(code, now, || Ok(()))
+    }
+
+    /// Validate the invite under its lock, then reserve the signed event
+    /// before spending a use. A concurrent copy of the event cannot spend
+    /// another use, and an invalid invite never occupies a replay slot.
+    pub fn redeem_with(&self, code: &str, now: u64, reserve: impl FnOnce() -> Result<(), AuthError>) -> Result<String, Redeem> {
         let _one = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _file = crate::access_lock::lock(&self.members_path).map_err(|e| Redeem::Io(e.to_string()))?;
+        self.redeem_with_locked(code, now, reserve)
+    }
+
+    /// Caller holds the access file lock through the subsequent members write.
+    pub fn redeem_with_locked(&self, code: &str, now: u64, reserve: impl FnOnce() -> Result<(), AuthError>) -> Result<String, Redeem> {
+        let id = self.id_of(code).ok_or(Redeem::Invalid)?;
         let mut invites = self.list().map_err(Redeem::Io)?;
         let invite = invites.iter_mut().find(|i| i.id == id).ok_or(Redeem::Invalid)?;
         if invite.expires_at <= now {
@@ -233,6 +255,7 @@ impl Invites {
         if invite.uses_left == 0 {
             return Err(Redeem::Used);
         }
+        reserve().map_err(Redeem::Auth)?;
         invite.uses_left -= 1;
         self.save(&invites, now).map_err(Redeem::Io)?;
         Ok(id)
@@ -290,6 +313,16 @@ mod tests {
         assert!(inv.create(1, 0, "", NOW).is_err());
         assert!(inv.create(1, 7, "a\nb", NOW).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_busy_replay_set_does_not_spend_an_invite() {
+        let dir = temp("busy-replay");
+        let inv = Invites::new(&dir.join("invites.json"), &[7u8; 32]);
+        let (code, _) = inv.create(1, 7, "busy", NOW).unwrap();
+        assert_eq!(inv.redeem_with(&code, NOW, || Err(AuthError::Busy)), Err(Redeem::Auth(AuthError::Busy)));
+        assert_eq!(inv.list().unwrap()[0].uses_left, 1);
+        assert!(inv.redeem(&code, NOW).is_ok());
     }
 
     #[test]

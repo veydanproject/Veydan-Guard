@@ -21,6 +21,37 @@ use nostr_sdk::prelude::ToBech32;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// The one deadline of the waits: a loaded host makes everything slow, and
+/// what does not happen within it is not going to.
+const WAIT: Duration = Duration::from_secs(30);
+
+/// Until `done`, or the deadline.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while !done() {
+        if std::time::Instant::now() > deadline {
+            panic!("never happened: {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// nostr-sdk's relay, running. It picks a random port, sees that it is
+/// free, lets it go and binds it later, so another test or job on the
+/// same host can take it in between (AddrInUse on the CI runner,
+/// 2026-11-18): a new relay picks a new port, five times at the most.
+async fn local_relay() -> LocalRelay {
+    let mut last = None;
+    for _ in 0..5 {
+        let relay = LocalRelay::builder().build();
+        match relay.run().await {
+            Ok(_) => return relay,
+            Err(e) => last = Some(e),
+        }
+    }
+    panic!("no local relay after five ports: {last:?}");
+}
+
 /// A strfry of a test: gives a challenge as the connection opens (when
 /// `challenge`), answers REQ with EOSE, AUTH with a refusal of its own (as
 /// strfry does for an alias), NEG-OPEN with a NEG-MSG; keeps every frame
@@ -162,10 +193,10 @@ async fn send(ws: &mut Ws, v: Value) {
     ws.send(Message::text(v.to_string())).await.unwrap();
 }
 
-/// The next text frame, within two seconds.
+/// The next text frame, within the deadline.
 async fn recv(ws: &mut Ws) -> Value {
     loop {
-        let m = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        let m = tokio::time::timeout(WAIT, ws.next())
             .await
             .expect("an answer in time");
         match m.expect("the connection is open").expect("a frame") {
@@ -333,7 +364,9 @@ async fn without_a_challenge_of_strfry_vguard_gives_its_own_and_keeps_the_auth()
 #[tokio::test]
 async fn a_question_before_the_auth_is_answered_after_it() {
     let (fake, up) = Fake::start(true).await;
-    let (addr, shared) = guard(up, "").await;
+    // The wait for the AUTH outlasts the test: the questions are answered
+    // because the AUTH came, not because the wait ran out.
+    let (addr, shared) = guard(up, "[limits]\nauth_wait_ms = 600000\n").await;
     let keys = Keys::generate();
     let me = keys.public_key().to_hex();
     let mut ws = connect(addr, &[]).await;
@@ -341,14 +374,12 @@ async fn a_question_before_the_auth_is_answered_after_it() {
 
     send(&mut ws, json!(["NEG-OPEN", "history", {"kinds": [1059], "#p": [me]}, "61"])).await;
     send(&mut ws, json!(["REQ", "dm", {"kinds": [1059], "#p": [me]}])).await;
-    // Nothing yet: neither an answer nor strfry hearing of it.
-    let early = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
-    assert!(early.is_err(), "{early:?}");
-    assert!(fake.verbs_with("history").is_empty() && fake.verbs_with("dm").is_empty());
-
+    // Nothing before the AUTH, by order rather than by a quiet while: an
+    // answer to a question would come on this connection ahead of the OK
+    // of the AUTH, and strfry hears the AUTH first (both checked below).
     let ev = auth_event(&keys, "strfry-challenge", "wss://relay.example.org");
     send(&mut ws, json!(["AUTH", ev])).await;
-    assert_eq!(recv(&mut ws).await, json!(["OK", ev["id"], true, ""]));
+    assert_eq!(recv(&mut ws).await, json!(["OK", ev["id"], true, ""]), "the first answer after the questions");
     assert_eq!(recv(&mut ws).await, json!(["NEG-MSG", "history", "61"]));
     assert_eq!(recv(&mut ws).await, json!(["EOSE", "dm"]));
     // strfry got the AUTH first, then the questions as they were sent.
@@ -388,12 +419,7 @@ async fn the_frames_behind_a_held_question_keep_their_order() {
     assert_eq!(recv(&mut ws).await, json!(["EOSE", "dm"]));
     assert_eq!(recv(&mut ws).await, json!(["EOSE", "pub"]));
     // The CLOSE has no answer: wait until strfry has it.
-    for _ in 0..40 {
-        if fake.order().len() == 6 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    eventually("strfry has the CLOSE", || fake.order().len() >= 6).await;
     assert_eq!(
         fake.order(),
         ["AUTH", "REQ dm", &format!("EVENT {}", note["id"].as_str().unwrap()), "REQ dm", "REQ pub", "CLOSE pub"]
@@ -414,16 +440,18 @@ async fn a_question_without_an_auth_is_refused_after_the_wait() {
     let a = recv(&mut ws).await;
     assert_eq!(a[0], "CLOSED");
     assert!(a[2].as_str().unwrap().starts_with("auth-required:"), "{a}");
+    // The wait was served: a busy host only makes it longer.
     assert!(t.elapsed() >= Duration::from_millis(350), "{:?}", t.elapsed());
     // The connection waited once: the next question is answered at once.
-    let t = std::time::Instant::now();
+    // A second wait would have ended the same way, by running out, and
+    // been counted when it did, before its refusal.
     send(&mut ws, json!(["NEG-OPEN", "n", {"kinds": [1059], "#p": [me]}, "61"])).await;
     let a = recv(&mut ws).await;
     assert_eq!(a[0], "NEG-ERR");
     assert!(a[2].as_str().unwrap().starts_with("auth-required:"), "{a}");
-    assert!(t.elapsed() < Duration::from_millis(300), "{:?}", t.elapsed());
     assert!(fake.verbs_with("dm").is_empty() && fake.verbs_with("n").is_empty());
-    assert!(shared.metrics.line().contains("auth_wait_expired=1"), "{}", shared.metrics.line());
+    let m = shared.metrics.line();
+    assert!(format!(" {m} ").contains(" auth_wait_expired=1 "), "one wait and no more: {m}");
 }
 
 /// At most MAX_HELD frames wait: one more ends the wait at once, and the
@@ -431,11 +459,11 @@ async fn a_question_without_an_auth_is_refused_after_the_wait() {
 #[tokio::test]
 async fn a_client_that_sends_too_much_ends_the_wait() {
     let (fake, up) = Fake::start(true).await;
-    let (addr, shared) = guard(up, "").await;
+    // A wait that outlasts the test: what ends it is the frame too many.
+    let (addr, shared) = guard(up, "[limits]\nauth_wait_ms = 600000\n").await;
     let me = Keys::generate().public_key().to_hex();
     let mut ws = connect(addr, &[]).await;
     recv(&mut ws).await;
-    let t = std::time::Instant::now();
     send(&mut ws, json!(["REQ", "dm", {"kinds": [1059], "#p": [me]}])).await;
     // The question and 31 more fit; the 33rd frame does not.
     for i in 0..proxy::MAX_HELD {
@@ -447,9 +475,9 @@ async fn a_client_that_sends_too_much_ends_the_wait() {
     for i in 0..proxy::MAX_HELD {
         assert_eq!(recv(&mut ws).await, json!(["EOSE", format!("p{i}")]));
     }
-    assert!(t.elapsed() < Duration::from_secs(3), "long before auth_wait_ms: {:?}", t.elapsed());
     assert_eq!(fake.saw("REQ"), proxy::MAX_HELD);
-    assert!(shared.metrics.line().contains("auth_wait_overflow=1"), "{}", shared.metrics.line());
+    let m = format!(" {} ", shared.metrics.line());
+    assert!(m.contains(" auth_wait_overflow=1 ") && m.contains(" auth_wait_expired=0 "), "{m}");
 }
 
 #[tokio::test]
@@ -474,7 +502,7 @@ async fn limits_hold() {
     // A frame over the limit ends the connection.
     let big = json!(["EVENT", {"content": "x".repeat(8192)}]).to_string();
     ws.send(Message::text(big)).await.unwrap();
-    let end = tokio::time::timeout(Duration::from_secs(2), async {
+    let end = tokio::time::timeout(WAIT, async {
         loop {
             match ws.next().await {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
@@ -484,12 +512,9 @@ async fn limits_hold() {
     })
     .await;
     assert!(end.is_ok(), "the connection ends");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        shared.metrics.line().contains("too_big=1"),
-        "{}",
-        shared.metrics.line()
-    );
+    // Counted as the session ends, which the client may see first.
+    eventually("the frame is counted as too big", || shared.metrics.line().contains("too_big=1")).await;
+    assert!(format!(" {} ", shared.metrics.line()).contains(" too_big=1 "), "{}", shared.metrics.line());
 }
 
 #[tokio::test]
@@ -502,14 +527,14 @@ async fn no_strfry_no_connection() {
         .unwrap();
     let (addr, shared) = guard(free, "").await;
     let mut ws = connect(addr, &[]).await;
-    let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+    let m = tokio::time::timeout(WAIT, ws.next())
         .await
         .unwrap();
     assert!(
         matches!(m, None | Some(Ok(Message::Close(_))) | Some(Err(_))),
         "{m:?}"
     );
-    assert!(shared.metrics.line().contains("upstream_down=1"));
+    eventually("strfry is counted as down", || shared.metrics.line().contains("upstream_down=1")).await;
 }
 
 /// The app's way: nostr-sdk with the key as its authenticator, the app key
@@ -518,8 +543,7 @@ async fn no_strfry_no_connection() {
 /// vguard gives its own; nostr-sdk signs in and asks again by itself.
 #[tokio::test]
 async fn the_client_of_the_app_gets_its_wraps_and_no_one_elses() {
-    let relay = LocalRelay::builder().build();
-    relay.run().await.unwrap();
+    let relay = local_relay().await;
     let url = relay.url().await;
     let up: SocketAddr = url
         .as_str_without_trailing_slash()
@@ -551,34 +575,51 @@ async fn the_client_of_the_app_gets_its_wraps_and_no_one_elses() {
     client.add_relay(guarded.as_str()).await.unwrap();
     client.connect().await;
     let mut notes = client.notifications();
-    client
+    let sub = client
         .subscribe(Filter::new().kind(Kind::GiftWrap).pubkey(me.public_key()))
         .await
-        .unwrap();
+        .unwrap()
+        .value;
 
-    // A new one to me, and one to the other, sent past vguard.
+    // What the relay holds comes first, up to the end of the stored; after
+    // it the subscription is live.
+    let mut got = Vec::new();
+    let mut until = async |stop: &dyn Fn(&ClientNotification) -> bool| {
+        tokio::time::timeout(WAIT, async {
+            while let Some(n) = notes.next().await {
+                if let ClientNotification::Event { event, .. } = &n {
+                    got.push(event.content.clone());
+                }
+                if stop(&n) {
+                    return;
+                }
+            }
+            panic!("the notifications ended");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("not in time: {got:?}, {}", shared.metrics.line()));
+    };
+    until(&|n| {
+        matches!(n, ClientNotification::Message { message, .. }
+            if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(id) if id.as_ref() == &sub))
+    })
+    .await;
+
+    // A new one to me, and one to the other, sent past vguard, and one more
+    // to me after them: the relay sends what it takes in the order it took
+    // it, on the one connection vguard reads, so whatever of the two came
+    // through came before the last.
     let direct = Client::default();
     direct.add_relay(url.as_str()).await.unwrap();
     direct.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
     direct.send_event(&wrap_to(&me, "new to me")).await.unwrap();
     direct
         .send_event(&wrap_to(&other, "new to other"))
         .await
         .unwrap();
-
-    let mut got = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(8), async {
-        while let Some(n) = notes.next().await {
-            if let ClientNotification::Event { event, .. } = n {
-                got.push(event.content.clone());
-                if got.len() == 2 {
-                    break;
-                }
-            }
-        }
-    })
-    .await;
+    direct.send_event(&wrap_to(&me, "last to me")).await.unwrap();
+    until(&|n| matches!(n, ClientNotification::Event { event, .. } if event.content == "last to me")).await;
+    got.pop();
     got.sort();
     assert_eq!(got, ["new to me", "old to me"], "{}", shared.metrics.line());
 
@@ -589,7 +630,7 @@ async fn the_client_of_the_app_gets_its_wraps_and_no_one_elses() {
                 .kind(Kind::GiftWrap)
                 .pubkey(other.public_key()),
         )
-        .timeout(Duration::from_secs(3))
+        .timeout(WAIT)
         .await;
     assert!(
         theirs.as_ref().map(|e| e.is_empty()).unwrap_or(true),
@@ -936,7 +977,7 @@ async fn http(addr: SocketAddr, method: &str, path: &str, headers: &[(&str, Stri
     s.write_all(req.as_bytes()).await.unwrap();
     s.write_all(body).await.unwrap();
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut buf)).await.unwrap().unwrap();
+    tokio::time::timeout(WAIT, s.read_to_end(&mut buf)).await.unwrap().unwrap();
     let text = String::from_utf8_lossy(&buf).to_string();
     let status = text[9..12].parse().unwrap();
     let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
@@ -961,6 +1002,130 @@ async fn join(addr: SocketAddr, keys: &Keys, code: &str, ip: &str) -> (u16, Valu
     let body = json!({"invite": code}).to_string();
     let path = format!("{API}/join");
     http(addr, "POST", &path, &[nip98(keys, "POST", &path, body.as_bytes()), ("X-Real-IP", ip.into())], body.as_bytes()).await
+}
+
+#[tokio::test]
+async fn invalid_joins_from_fresh_keys_do_not_exhaust_replay_slots() {
+    let dir = access_dir("fresh-invalid-joins", &[]);
+    let (_fake, up) = Fake::start(true).await;
+    let (_addr, shared) = guard(up, &access_toml("team", &dir, &[])).await;
+    let api = api_up(shared.clone()).await;
+    for i in 0..20 {
+        assert_eq!(join(api, &Keys::generate(), "vi1.invalid.invalid", &format!("198.51.100.{}", i + 1)).await.0, 401);
+    }
+    let invites = vguard::invites::Invites::open(&shared.config.access).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let (code, _) = invites.create(1, 7, "valid", now).unwrap();
+    assert_eq!(join(api, &Keys::generate(), &code, "203.0.113.1").await.0, 200);
+}
+
+#[tokio::test]
+async fn me_and_admin_requests_are_limited_by_address_and_key() {
+    let admin = Keys::generate();
+    let dir = access_dir("http-limits", &[]);
+    let (_fake, up) = Fake::start(true).await;
+    let (_addr, shared) = guard(up, &access_toml("team", &dir, &[admin.public_key().to_hex()])).await;
+    let api = api_up(shared.clone()).await;
+    let me = format!("{API}/me");
+    for _ in 0..60 {
+        let key = Keys::generate();
+        let headers = [nip98(&key, "GET", &me, b""), ("X-Real-IP", "198.51.100.80".into())];
+        assert_eq!(http(api, "GET", &me, &headers, b"").await.0, 200);
+    }
+    let headers = [nip98(&Keys::generate(), "GET", &me, b""), ("X-Real-IP", "198.51.100.80".into())];
+    assert_eq!(http(api, "GET", &me, &headers, b"").await, (429, json!({"error": "rate_limited"})));
+    // The /me limit uses a separate budget from /join; another signer can
+    // still join on the same API instance after the 61st /me was refused.
+    let invite_store = vguard::invites::Invites::open(&shared.config.access).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let (code, _) = invite_store.create(1, 7, "after /me", now).unwrap();
+    assert_eq!(join(api, &Keys::generate(), &code, "198.51.100.80").await, (200, json!({"member": true})));
+    let invites = format!("{API}/invites");
+    for i in 0..60 {
+        let headers = [nip98(&admin, "GET", &invites, b""), ("X-Real-IP", format!("203.0.113.{}", i + 1))];
+        assert_eq!(http(api, "GET", &invites, &headers, b"").await.0, 200);
+    }
+    let headers = [nip98(&admin, "GET", &invites, b""), ("X-Real-IP", "203.0.113.80".into())];
+    assert_eq!(http(api, "GET", &invites, &headers, b"").await, (429, json!({"error": "rate_limited"})));
+}
+
+#[tokio::test]
+async fn concurrent_replay_spends_only_one_invite_use() {
+    let dir = access_dir("concurrent-join", &[]);
+    let (_fake, up) = Fake::start(true).await;
+    let (_addr, shared) = guard(up, &access_toml("team", &dir, &[])).await;
+    let api = api_up(shared.clone()).await;
+    let invites = vguard::invites::Invites::open(&shared.config.access).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let (code, invite) = invites.create(2, 7, "two uses", now).unwrap();
+    let key = Keys::generate();
+    let path = format!("{API}/join");
+    let body = json!({"invite": code}).to_string();
+    let signed = nip98(&key, "POST", &path, body.as_bytes());
+    let headers = [signed, ("X-Real-IP", "198.51.100.40".into())];
+    let (first, second) = tokio::join!(
+        http(api, "POST", &path, &headers, body.as_bytes()),
+        http(api, "POST", &path, &headers, body.as_bytes()),
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(statuses, [200, 401]);
+    assert_eq!(invites.list().unwrap().iter().find(|i| i.id == invite.id).unwrap().uses_left, 1);
+    assert_eq!(join(api, &Keys::generate(), &code, "198.51.100.41").await.0, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_writes_and_http_joins_preserve_members_and_invite_uses() {
+    const COUNT: usize = 20;
+    let removed: Vec<_> = (0..COUNT).map(|_| Keys::generate().public_key().to_hex()).collect();
+    let dir = access_dir("cli-join-writers", &removed);
+    let config = dir.join("vguard.toml");
+    std::fs::write(&config, format!("relay_hosts = [\"relay.example.org\"]\n{}", access_toml("team", &dir, &[]))).unwrap();
+    let (_fake, up) = Fake::start(true).await;
+    let (_addr, shared) = guard(up, &access_toml("team", &dir, &[])).await;
+    let api = api_up(shared.clone()).await;
+    let invites = vguard::invites::Invites::open(&shared.config.access).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let (code, invite) = invites.create(COUNT as u32, 7, "parallel joins", now).unwrap();
+    let cli = std::thread::spawn(move || {
+        for key in removed {
+            for args in [vec!["members", "remove", key.as_str()], vec!["invite", "--uses", "1"]] {
+                let output = std::process::Command::new(env!("CARGO_BIN_EXE_vguard"))
+                    .arg("access").arg("--config").arg(&config).args(args).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            }
+        }
+    });
+    let joined: Vec<_> = (0..COUNT).map(|_| Keys::generate()).collect();
+    for (i, keys) in joined.iter().enumerate() {
+        assert_eq!(join(api, keys, &code, &format!("198.51.100.{}", i + 1)).await.0, 200);
+    }
+    cli.join().unwrap();
+    let members = veydan_denied::KeyList::from_file(&dir.join("members.txt"));
+    assert_eq!(members.len(), COUNT);
+    for keys in joined {
+        assert!(members.contains(&keys.public_key().to_hex()));
+    }
+    let list = invites.list().unwrap();
+    assert_eq!(list.len(), COUNT + 1);
+    assert_eq!(list.iter().find(|i| i.id == invite.id).unwrap().uses_left, 0);
+}
+
+#[test]
+fn mode_command_reads_valid_toml_variants() {
+    let dir = access_dir("mode-cli", &[]);
+    let base = format!("relay_hosts = [\"relay.example.org\"]\n{}", access_toml("team", &dir, &[]));
+    let config = dir.join("vguard.toml");
+    for table in ["[access]", "  [access] # comment"] {
+        for value in ["\"team\"", "'team'"] {
+            let toml = base.replace("[access]", table).replace("mode = \"team\"", &format!("mode = {value} # comment"));
+            std::fs::write(&config, toml).unwrap();
+            let out = std::process::Command::new(env!("CARGO_BIN_EXE_vguard"))
+                .args(["mode", "--config", config.to_str().unwrap()]).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "team\n");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1003,13 +1168,16 @@ async fn join_with_an_invite_then_read_as_member() {
     let id = "00112233445566ff";
     std::fs::write(dir.join("invites.json"), json!([{"id": id, "label": "", "uses_left": 3, "expires_at": now - 1, "created_at": now - 100}]).to_string()).unwrap();
     assert_eq!(join(api, &boris, &invites.code_of(id), "198.51.100.2").await, (401, json!({"error": "invite_expired"})));
-    // No signature, a replayed one, one for another address: auth_invalid.
+    // An invalid invite does not use up the event; a successful request does.
     let body = json!({"invite": code}).to_string();
     let path = format!("{API}/join");
     assert_eq!(http(api, "POST", &path, &[], body.as_bytes()).await, (401, json!({"error": "auth_invalid"})));
     let h = nip98(&boris, "POST", &path, body.as_bytes());
-    assert_eq!(http(api, "POST", &path, std::slice::from_ref(&h), body.as_bytes()).await.0, 401, "invite_used, the event used up");
-    assert_eq!(http(api, "POST", &path, &[h], body.as_bytes()).await, (401, json!({"error": "auth_invalid"})), "a replay");
+    assert_eq!(http(api, "POST", &path, std::slice::from_ref(&h), body.as_bytes()).await, (401, json!({"error": "invite_invalid"})));
+    assert_eq!(http(api, "POST", &path, &[h], body.as_bytes()).await, (401, json!({"error": "invite_invalid"})), "a rejected request uses no replay slot");
+    let member_header = nip98(&anna, "POST", &path, body.as_bytes());
+    assert_eq!(http(api, "POST", &path, std::slice::from_ref(&member_header), body.as_bytes()).await.0, 200);
+    assert_eq!(http(api, "POST", &path, &[member_header], body.as_bytes()).await, (401, json!({"error": "auth_invalid"})), "a replay");
     let elsewhere = nip98(&boris, "POST", &format!("{API}/me"), body.as_bytes());
     assert_eq!(http(api, "POST", &path, &[elsewhere], body.as_bytes()).await, (401, json!({"error": "auth_invalid"})));
     // Ten joins a minute from one address.
@@ -1120,8 +1288,7 @@ async fn the_client_of_the_app_signs_in_and_sends_again_in_a_team() {
     let member = Keys::generate();
     let guest = Keys::generate();
     for (name, wait) in [("held", 5000), ("resent", 0)] {
-        let relay = LocalRelay::builder().build();
-        relay.run().await.unwrap();
+        let relay = local_relay().await;
         let url = relay.url().await;
         let up: SocketAddr = url.as_str_without_trailing_slash().trim_start_matches("ws://").parse().unwrap();
         let dir = access_dir(&format!("sdk-{name}"), &[member.public_key().to_hex()]);
